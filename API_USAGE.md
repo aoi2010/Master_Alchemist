@@ -94,3 +94,105 @@ export SHIP_CHANNEL_ID=C12345678
 When the service starts it first prefers the real environment. If a variable is not present, the app will look for a local `.env` file and use values from there for any keys that are missing. This keeps local development convenient while keeping production configurations secure in the real environment.
 
 If you want, I can add a small client snippet (Python/JS) that demonstrates calling `/ship` with the required header.
+
+## POST /review-accept — approve a submitted project
+
+This endpoint submits a positive review for a project that was previously submitted via `/ship`. It posts a review message to the ship channel with a custom reviewer profile and sends a direct message notification to the project submitter.
+
+- Endpoint: `POST /review-accept`
+- Required headers: `Authorization: Bearer {AUTH_BEARER_TOKEN}`
+- Required body JSON:
+  - `user_id` (string): Slack user ID of the project submitter (e.g. `U123ABCD`).
+  - `project_name` (string): Name of the project being reviewed.
+  - `project_link` (string): URL to the project.
+  - `reviewer_id` (string): Slack user ID of the reviewer (e.g. `U987ZYXW`). The reviewer's display name and profile picture are automatically fetched from Slack.
+  - `feedback` (string): Acceptance feedback or comments (1–2000 characters).
+  - `currencies` (string): What the submitter receives (e.g. `100 Gold, 50 Silver`).
+
+Example:
+
+```json
+{
+  "user_id": "U123ABCD",
+  "project_name": "Awesome Widget",
+  "project_link": "https://example.com/awesome-widget",
+  "reviewer_id": "U987ZYXW",
+  "feedback": "Excellent implementation. The code is clean and well-structured.",
+  "currencies": "100 Gold, 50 Silver"
+}
+```
+
+curl example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/review-accept \
+  -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"user_id\": \"U123ABCD\",
+    \"project_name\": \"Awesome Widget\",
+    \"project_link\": \"https://example.com/awesome-widget\",
+    \"reviewer_id\": \"U987ZYXW\",
+    \"feedback\": \"Excellent implementation. The code is clean and well-structured.\",
+    \"currencies\": \"100 Gold, 50 Silver\"
+  }"
+```
+
+Behavior:
+- Fetches the reviewer's display name and profile picture from their Slack profile.
+- Posts a message to the `SHIP_CHANNEL_ID` spoofed as the reviewer (with their display name and avatar) that says:
+  - `<@{user_id}> Your {project_name} has been reviewed. Please check your DM by <@{reviewer_id}> for details.`
+- Sends a detailed direct message to `user_id` with the review feedback:
+  - `:white_check_mark: {reviewer_name} has been impressed by your project {project_name}.`
+  - `Acceptance Feedback: {feedback}`
+  - `You get: {currencies}`
+- The project name in the DM is hyperlinked to the project URL.
+
+## POST /review-reject — reject a submitted project
+
+This endpoint submits a negative review for a project that was previously submitted via `/ship`. It posts a review message to the ship channel with a custom reviewer profile and sends a direct message notification to the project submitter.
+
+- Endpoint: `POST /review-reject`
+- Required headers: `Authorization: Bearer {AUTH_BEARER_TOKEN}`
+- Required body JSON:
+  - `user_id` (string): Slack user ID of the project submitter (e.g. `U123ABCD`).
+  - `project_name` (string): Name of the project being reviewed.
+  - `project_link` (string): URL to the project.
+  - `reviewer_id` (string): Slack user ID of the reviewer (e.g. `U987ZYXW`). The reviewer's display name and profile picture are automatically fetched from Slack.
+  - `feedback` (string): Rejection feedback or comments (1–2000 characters).
+
+Example:
+
+```json
+{
+  "user_id": "U123ABCD",
+  "project_name": "Awesome Widget",
+  "project_link": "https://example.com/awesome-widget",
+  "reviewer_id": "U987ZYXW",
+  "feedback": "The project does not meet the quality standards. Please revise and resubmit."
+}
+```
+
+curl example:
+
+```bash
+curl -X POST http://127.0.0.1:8000/review-reject \
+  -H "Authorization: Bearer replace-me" \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"user_id\": \"U123ABCD\",
+    \"project_name\": \"Awesome Widget\",
+    \"project_link\": \"https://example.com/awesome-widget\",
+    \"reviewer_id\": \"U987ZYXW\",
+    \"feedback\": \"The project does not meet the quality standards. Please revise and resubmit.\"
+  }"
+```
+
+Behavior:
+- Fetches the reviewer's display name and profile picture from their Slack profile.
+- Posts a message to the `SHIP_CHANNEL_ID` spoofed as the reviewer (with their display name and avatar) that says:
+  - `<@{user_id}> Your {project_name} has been reviewed. Please check your DM by <@{reviewer_id}> for details.`
+- Sends a detailed direct message to `user_id` with the review feedback:
+  - `:x: {reviewer_name} has been unimpressed by your project {project_name}.`
+  - `Rejection Feedback: {feedback}`
+- The project name in the DM is hyperlinked to the project URL.

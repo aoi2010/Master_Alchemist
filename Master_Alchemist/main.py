@@ -57,6 +57,23 @@ class ShipPayload(BaseModel):
 	project_link: str = Field(min_length=1)
 
 
+class ReviewAcceptPayload(BaseModel):
+	user_id: str = Field(min_length=1, description="Slack user ID of project submitter")
+	project_name: str = Field(min_length=1)
+	project_link: str = Field(min_length=1)
+	reviewer_id: str = Field(min_length=1, description="Slack user ID of reviewer")
+	feedback: str = Field(min_length=1, max_length=2000)
+	currencies: str = Field(min_length=1, description="Currency reward string e.g. '100 Gold, 50 Silver'")
+
+
+class ReviewRejectPayload(BaseModel):
+	user_id: str = Field(min_length=1, description="Slack user ID of project submitter")
+	project_name: str = Field(min_length=1)
+	project_link: str = Field(min_length=1)
+	reviewer_id: str = Field(min_length=1, description="Slack user ID of reviewer")
+	feedback: str = Field(min_length=1, max_length=2000)
+
+
 class SlackDispatchResult(BaseModel):
 	ok: bool
 	channel: str
@@ -103,14 +120,7 @@ class SlackRelay:
 				"type": "section",
 				"text": {
 					"type": "mrkdwn",
-					"text": f"Your project *{project_name}* has been submitted for review.",
-				},
-			},
-			{
-				"type": "section",
-				"text": {
-					"type": "mrkdwn",
-					"text": f"<{project_link}|View You Project>",
+					"text": f"Your project <{project_link}|*{project_name}*> has been submitted for review.",
 				},
 			},
 		]
@@ -118,6 +128,165 @@ class SlackRelay:
 		resp = await self.app.client.chat_postMessage(
 			channel=channel,
 			text=f"Your project {project_name} has been submitted for review.",
+			blocks=blocks,
+		)
+
+		return SlackDispatchResult(ok=bool(resp["ok"]), channel=channel, ts=resp.get("ts"))
+
+
+	async def post_review_accept(self, user_id: str, project_name: str, project_link: str, reviewer_id: str, feedback: str, currencies: str) -> dict[str, Any]:
+		"""Post acceptance review with custom reviewer profile in channel and detailed message in DM."""
+		ship_channel = self.settings.ship_channel_id
+		if not ship_channel:
+			raise HTTPException(status_code=400, detail="SHIP_CHANNEL_ID not configured")
+
+		# Fetch reviewer's profile for name and avatar
+		user_info = await self.app.client.users_info(user=reviewer_id)
+		user_profile = user_info.get("user", {})
+		reviewer_name = user_profile.get("profile", {}).get("display_name") or user_profile.get("real_name", "Unknown")
+		reviewer_avatar = user_profile.get("profile", {}).get("image_192") or user_profile.get("profile", {}).get("image_512", "")
+
+		# Post to ship channel spoofed as reviewer
+		channel_message = f"<@{user_id}> Your *{project_name}* has been reviewed. Please check your DM by <@U0B18V07GQ3> for details."
+		resp = await self.app.client.chat_postMessage(
+			channel=ship_channel,
+			text=channel_message,
+			username=reviewer_name,
+			icon_url=reviewer_avatar,
+		)
+
+		# Send detailed review to DM
+		await self.send_review_dm_accept(user_id, project_name, project_link, reviewer_name, reviewer_id, feedback, currencies)
+
+		return {"ok": bool(resp["ok"]), "channel": ship_channel, "ts": resp.get("ts")}
+
+	async def post_review_reject(self, user_id: str, project_name: str, project_link: str, reviewer_id: str, feedback: str) -> dict[str, Any]:
+		"""Post rejection review with custom reviewer profile in channel and detailed message in DM."""
+		ship_channel = self.settings.ship_channel_id
+		if not ship_channel:
+			raise HTTPException(status_code=400, detail="SHIP_CHANNEL_ID not configured")
+
+		# Fetch reviewer's profile for name and avatar
+		user_info = await self.app.client.users_info(user=reviewer_id)
+		user_profile = user_info.get("user", {})
+		reviewer_name = user_profile.get("profile", {}).get("display_name") or user_profile.get("real_name", "Unknown")
+		reviewer_avatar = user_profile.get("profile", {}).get("image_192") or user_profile.get("profile", {}).get("image_512", "")
+
+		# Post to ship channel spoofed as reviewer
+		channel_message = f"<@{user_id}> Your *{project_name}* has been reviewed. Please check your DM by <@U0B18V07GQ3> for details."
+		resp = await self.app.client.chat_postMessage(
+			channel=ship_channel,
+			text=channel_message,
+			username=reviewer_name,
+			icon_url=reviewer_avatar,
+		)
+
+		# Send detailed review to DM
+		await self.send_review_dm_reject(user_id, project_name, project_link, reviewer_name, reviewer_id, feedback)
+
+		return {"ok": bool(resp["ok"]), "channel": ship_channel, "ts": resp.get("ts")}
+
+	async def send_review_dm_accept(self, user_id: str, project_name: str, project_link: str, reviewer_name: str, reviewer_id: str, feedback: str, currencies: str) -> SlackDispatchResult:
+		"""Send detailed acceptance review to DM as mrkdwn blocks so it can be edited later."""
+		conv = await self.app.client.conversations_open(users=user_id)
+		channel = conv["channel"]["id"]
+
+		blocks = [
+			{
+				"type": "header",
+				"text": {"type": "plain_text", "text": "Project Reviewed. Congratulations!"},
+			},
+			{
+				"type": "section",
+				"text": {
+					"type": "mrkdwn",
+					"text": f"Nice Master Cleric <@{reviewer_id}> has been impressed by your project *{project_name}*.",
+				},
+			},
+			{
+				"type": "section",
+				"text": {
+					"type": "mrkdwn",
+					"text": f"*Acceptance Feedback:*{feedback}\n\n*You get:* {currencies}",
+				},
+			},
+			{
+				"type": "divider",
+			},
+			{
+				"type": "context",
+				"elements": [
+					{"type": "mrkdwn", "text": "Keep up the great work and continue to refine your alchemical skills!"},
+				],
+			},
+			{
+				"type": "actions",
+				"elements": [
+					{
+						"type": "button",
+						"text": {"type": "plain_text", "text": "View Project"},
+						"url": project_link,
+					}
+				],
+			},
+		]
+
+		resp = await self.app.client.chat_postMessage(
+			channel=channel,
+			text=f"{reviewer_name} reviewed {project_name}",
+			blocks=blocks,
+		)
+
+		return SlackDispatchResult(ok=bool(resp["ok"]), channel=channel, ts=resp.get("ts"))
+
+	async def send_review_dm_reject(self, user_id: str, project_name: str, project_link: str, reviewer_name: str, reviewer_id: str, feedback: str) -> SlackDispatchResult:
+		"""Send detailed rejection review to DM as mrkdwn blocks so it can be edited later."""
+		conv = await self.app.client.conversations_open(users=user_id)
+		channel = conv["channel"]["id"]
+
+		blocks = [
+			{
+				"type": "header",
+				"text": {"type": "plain_text", "text": "Oof! Your project needs some changes..."},
+			},
+			{
+				"type": "section",
+				"text": {
+					"type": "mrkdwn",
+					"text": f"Nice Master Cleric <@{reviewer_id}> has reviewed your project *{project_name}*."
+				},
+			},
+			{
+				"type": "section",
+				"text": {
+					"type": "mrkdwn",
+					"text": f"*Rejection Feedback:*{feedback}"
+				},
+			},
+			{
+				"type": "divider",
+			},
+			{
+				"type": "context",
+				"elements": [
+					{"type": "mrkdwn", "text": "Don't give up! Review the feedback, make improvements, and ship again!"},
+				],
+			},
+			{
+				"type": "actions",
+				"elements": [
+					{
+						"type": "button",
+						"text": {"type": "plain_text", "text": "View Project"},
+						"url": project_link,
+					},
+				],
+			},
+		]
+
+		resp = await self.app.client.chat_postMessage(
+			channel=channel,
+			text=f"{reviewer_name} reviewed {project_name}",
 			blocks=blocks,
 		)
 
@@ -172,9 +341,51 @@ async def ship_project(
 	}
 
 
+@app.post("/review-accept")
+async def review_accept(
+	payload: ReviewAcceptPayload,
+	_: None = Depends(verify_bearer_token),
+) -> dict[str, Any]:
+	"""Handle a positive review for a submitted project.
+
+	Posts a review message to the ship channel with custom reviewer profile (name/avatar)
+	and sends DM notification to the project submitter.
+	"""
+	review_response = await slack_relay.post_review_accept(
+		user_id=payload.user_id,
+		project_name=payload.project_name,
+		project_link=payload.project_link,
+		reviewer_id=payload.reviewer_id,
+		feedback=payload.feedback,
+		currencies=payload.currencies,
+	)
+	return {"ok": review_response["ok"], "channel": review_response["channel"], "ts": review_response.get("ts")}
+
+
+@app.post("/review-reject")
+async def review_reject(
+	payload: ReviewRejectPayload,
+	_: None = Depends(verify_bearer_token),
+) -> dict[str, Any]:
+	"""Handle a negative review for a submitted project.
+
+	Posts a review message to the ship channel with custom reviewer profile (name/avatar)
+	and sends DM notification to the project submitter.
+	"""
+	review_response = await slack_relay.post_review_reject(
+		user_id=payload.user_id,
+		project_name=payload.project_name,
+		project_link=payload.project_link,
+		reviewer_id=payload.reviewer_id,
+		feedback=payload.feedback,
+	)
+	return {"ok": review_response["ok"], "channel": review_response["channel"], "ts": review_response.get("ts")}
+
+
 def main() -> None:
 	uvicorn.run(app, host=settings.api_host, port=settings.api_port, reload=False)
 
 
 if __name__ == "__main__":
 	main()
+
