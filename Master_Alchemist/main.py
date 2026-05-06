@@ -1,4 +1,6 @@
+import asyncio
 import os
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -49,6 +51,8 @@ class Settings:
 	slack_signing_secret: str = os.getenv("SLACK_SIGNING_SECRET", "")
 	# Optional ship channel id for the /ship endpoint; can be set as an environment variable
 	ship_channel_id: str = os.getenv("SHIP_CHANNEL_ID", "")
+	# Optional logging channel id for periodic heartbeat messages; can be set as an environment variable
+	logging_channel_id: str = os.getenv("LOGGING_CHANNEL_ID", "")
 
 
 class ShipPayload(BaseModel):
@@ -111,6 +115,11 @@ def verify_bearer_token(
 	authorization: str | None = Header(default=None, alias="Authorization"),
 ) -> None:
 	settings = get_settings()
+	if not settings.auth_bearer_token:
+		raise HTTPException(
+			status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+			detail="Server missing AUTH_BEARER_TOKEN; configure it in the environment",
+		)
 	expected = f"Bearer {settings.auth_bearer_token}"
 	if authorization != expected:
 		raise HTTPException(
@@ -133,9 +142,9 @@ class SlackRelay:
 		if target_id.startswith("U"):
 			conv = await self.app.client.conversations_open(users=target_id)
 			return conv["channel"]["id"]
-		if target_id.startswith("C"):
+		if target_id.startswith("C") or target_id.startswith("G"):
 			return target_id
-		raise HTTPException(status_code=400, detail="target_id must start with U for DM or C for channel")
+		raise HTTPException(status_code=400, detail="target_id must start with U for DM or C/G for channel")
 
 	@staticmethod
 	def _format_order_fields(order_id: str, item_name: str, qty: str, cost: str) -> list[dict[str, str]]:
@@ -459,9 +468,42 @@ class SlackRelay:
 		return SlackDispatchResult(ok=bool(resp["ok"]), channel=channel, ts=resp.get("ts"))
 
 
+async def bot_heartbeat_task(settings: Settings, slack_relay: SlackRelay) -> None:
+	"""Background task that sends a heartbeat message every 5 minutes to the logging channel."""
+	if not settings.logging_channel_id:
+		return
+
+	while True:
+		try:
+			await asyncio.sleep(300)  # 5 minutes
+			resp = await slack_relay.app.client.chat_postMessage(
+				channel=settings.logging_channel_id,
+				text=":alchemist: Bot is online!",
+			)
+			if not resp.get("ok"):
+				print(f"Failed to send heartbeat: {resp}")
+		except Exception as e:
+			print(f"Heartbeat task error (non-fatal): {e}")
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+	"""Manage app startup and shutdown, including background tasks."""
+	task = None
+	if settings.logging_channel_id:
+		task = asyncio.create_task(bot_heartbeat_task(settings, slack_relay))
+	yield
+	if task:
+		task.cancel()
+		try:
+			await task
+		except asyncio.CancelledError:
+			pass
+
+
 settings = get_settings()
 slack_relay = SlackRelay(settings)
-app = FastAPI(title=settings.app_name)
+app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
 @app.get("/healthz")
@@ -503,7 +545,7 @@ async def ship_project(
 
 	return {
 		"public": {"ok": bool(public_resp["ok"]), "channel": ship_channel, "ts": public_resp.get("ts")},
-		"dm": dm_resp.dict(),
+		"dm": dm_resp.model_dump(),
 	}
 
 
