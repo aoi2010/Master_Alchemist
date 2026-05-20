@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import uvicorn
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, status
 from pydantic import BaseModel, Field
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
@@ -84,6 +84,7 @@ class FulfillOrderPayload(BaseModel):
 	item_name: str = Field(min_length=1)
 	qty: str = Field(min_length=1)
 	cost: str = Field(min_length=1)
+	comment: str | None = Field(default=None, max_length=2000)
 
 
 class FulfillFullfilledPayload(BaseModel):
@@ -166,8 +167,10 @@ class SlackRelay:
 		cost: str,
 		closing_line: str,
 		extra_lines: list[str] | None = None,
+		extra_fields: list[dict[str, str]] | None = None,
 	) -> SlackDispatchResult:
 		channel = await self._resolve_target_channel(user_id)
+		fields = self._format_order_fields(order_id, item_name, qty, cost) + (extra_fields or [])
 		blocks = [
 			{
 				"type": "header",
@@ -180,7 +183,7 @@ class SlackRelay:
 			{
 				"type": "section",
 				"text": {"type": "mrkdwn", "text": "*Order Details:*"},
-				"fields": self._format_order_fields(order_id, item_name, qty, cost),
+				"fields": fields,
 			},
 			{
 				"type": "divider",
@@ -375,6 +378,21 @@ class SlackRelay:
 			extra_lines=None,
 		)
 
+	async def send_fulfill_reject_dm(self, payload: FulfillOrderPayload) -> SlackDispatchResult:
+		comment_value = payload.comment or "(none)"
+		return await self._send_order_update_dm(
+			user_id=payload.user_id,
+			headline=f":x: Order #{payload.order_id} Rejected",
+			status_line="Rejected. Please review the notes from the team.",
+			order_id=payload.order_id,
+			item_name=payload.item_name,
+			qty=payload.qty,
+			cost=payload.cost,
+			closing_line="If you have questions, reach out in the help channel.",
+			extra_lines=None,
+			extra_fields=[{"type": "mrkdwn", "text": f"*Comment:* {comment_value}"}],
+		)
+
 	async def send_fulfill_fullfilled_dm(self, payload: FulfillFullfilledPayload) -> SlackDispatchResult:
 		channel = await self._resolve_target_channel(payload.user_id)
 		blocks = [
@@ -511,9 +529,19 @@ async def healthz() -> dict[str, str]:
 	return {"status": "ok"}
 
 
-@app.post("/slack/events")
+@app.post("/slack/events", status_code=200)
 async def slack_events(request: Request):
-	return await slack_relay.handler.handle(request)
+	# Slack signature verification is enforced by the Bolt handler when a signing secret is set.
+	if not settings.slack_signing_secret:
+		raise HTTPException(
+			status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+			detail="Server missing SLACK_SIGNING_SECRET; configure it in the environment",
+		)
+	try:
+		return await slack_relay.handler.handle(request)
+	except Exception:
+		# Always acknowledge to prevent Slack retries from leaking errors to callers.
+		return Response(status_code=status.HTTP_200_OK)
 
 
 @app.post("/ship")
@@ -605,6 +633,15 @@ async def fulfill_approved(
 	_: None = Depends(verify_bearer_token),
 ) -> dict[str, Any]:
 	response = await slack_relay.send_fulfill_approved_dm(payload)
+	return {"ok": response.ok, "channel": response.channel, "ts": response.ts}
+
+
+@app.post("/fulfill_reject")
+async def fulfill_reject(
+	payload: FulfillOrderPayload,
+	_: None = Depends(verify_bearer_token),
+) -> dict[str, Any]:
+	response = await slack_relay.send_fulfill_reject_dm(payload)
 	return {"ok": response.ok, "channel": response.channel, "ts": response.ts}
 
 
