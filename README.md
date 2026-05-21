@@ -19,6 +19,7 @@ It provides a small FastAPI server that:
 - **Order fulfillment DM updates**:
   - `POST /fulfill_pending`
   - `POST /fulfill_approved`
+  - `POST /fulfill_reject`
   - `POST /fulfill_fullfilled`
 - **Custom message relay** (`POST /custom`) to a user DM (`U…`) or channel (`C…`/`G…`).
 - Optional **heartbeat logging**: if `LOGGING_CHANNEL_ID` is set, the bot posts `:alchemist: Bot is online!` every 5 minutes.
@@ -116,13 +117,39 @@ You can also run via Uvicorn directly:
 uvicorn Master_Alchemist.main:app --host 0.0.0.0 --port 8000
 ```
 
+## Run with Docker
+
+Build the image:
+
+```bash
+docker build -t m_alc .
+```
+
+Run the container:
+
+```bash
+docker run -d -p 8000:8000 --restart always --name my-bot-service \
+  -e AUTH_BEARER_TOKEN="$AUTH_BEARER_TOKEN" \
+  -e SLACK_BOT_TOKEN="$SLACK_BOT_TOKEN" \
+  -e SLACK_SIGNING_SECRET="$SLACK_SIGNING_SECRET" \
+  -e SHIP_CHANNEL_ID="$SHIP_CHANNEL_ID" \
+  -e LOGGING_CHANNEL_ID="$LOGGING_CHANNEL_ID" \
+  m_alc
+```
+
+View logs:
+
+```bash
+docker logs my-bot-service
+```
+
 ## API
 
 Base URL in examples:
 
 ```bash
-BASE_URL=http://127.0.0.1:8000
-AUTH="replace-me"
+BASE_URL="http://${API_HOST:-0.0.0.0}:${API_PORT:-8000}"
+AUTH="${AUTH_BEARER_TOKEN}"
 ```
 
 ### GET /healthz
@@ -134,6 +161,7 @@ curl -sS "$BASE_URL/healthz"
 ### POST /slack/events
 
 This endpoint is called by Slack. Slack signs requests; a plain `curl` without a correct `X-Slack-Signature` will not work.
+The handler always acknowledges with HTTP 200 to prevent Slack retries.
 
 To test it locally, use the provided test script with `--test-slack-events`.
 
@@ -193,6 +221,15 @@ curl -sS -X POST "$BASE_URL/fulfill_approved" \
   -H "Authorization: Bearer $AUTH" \
   -H "Content-Type: application/json" \
   -d '{"user_id":"U123ABCD","order_id":"1002","item_name":"Shiny Relic","qty":"1","cost":"67 potions"}'
+```
+
+### POST /fulfill_reject
+
+```bash
+curl -sS -X POST "$BASE_URL/fulfill_reject" \
+  -H "Authorization: Bearer $AUTH" \
+  -H "Content-Type: application/json" \
+  -d '{"user_id":"U123ABCD","order_id":"1002","item_name":"Shiny Relic","qty":"1","cost":"67 potions","comment":"Out of stock this week."}'
 ```
 
 ### POST /fulfill_fullfilled
