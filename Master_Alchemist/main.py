@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -9,6 +10,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response, 
 from pydantic import BaseModel, Field
 from slack_bolt.adapter.fastapi.async_handler import AsyncSlackRequestHandler
 from slack_bolt.async_app import AsyncApp
+from starlette.routing import Match
 
 
 def load_dotenv_if_present(path: str = ".env") -> None:
@@ -53,6 +55,8 @@ class Settings:
 	ship_channel_id: str = os.getenv("SHIP_CHANNEL_ID", "")
 	# Optional logging channel id for periodic heartbeat messages; can be set as an environment variable
 	logging_channel_id: str = os.getenv("LOGGING_CHANNEL_ID", "")
+	# Optional user id to cc in logging thread; set to empty to disable
+	logging_cc_user_id: str = os.getenv("LOGGING_CC_USER_ID", "")
 
 
 class ShipPayload(BaseModel):
@@ -108,6 +112,95 @@ class SlackDispatchResult(BaseModel):
 	ts: str | None = None
 
 
+def _truncate_message(value: str, limit: int = 3000) -> str:
+	if len(value) <= limit:
+		return value
+	return f"{value[:limit]}...(truncated)"
+
+
+def _format_request_snapshot(request: Request, body: bytes | None) -> str:
+	sensitive_headers = {
+		"authorization",
+		"proxy-authorization",
+		"cookie",
+		"set-cookie",
+		"x-slack-signature",
+	}
+	redacted = "[redacted]"
+	headers_lines = []
+	for key, value in request.headers.items():
+		if key.lower() in sensitive_headers:
+			headers_lines.append(f"{key}: {redacted}")
+		else:
+			headers_lines.append(f"{key}: {value}")
+	headers_text = "\n".join(headers_lines)
+	body_text = ""
+	if body:
+		body_text = body.decode("utf-8", errors="replace")
+	return "\n\n".join(
+		[
+			f"Request headers:\n{headers_text or '(none)'}",
+			f"Request body:\n{body_text or '(empty)'}",
+		]
+	)
+
+
+def _format_response_snapshot(body_text: str) -> str:
+	return f"Response body:\n{body_text or '(empty)'}"
+
+
+def _format_traceback(trace: str) -> str:
+	return f"Traceback:\n{trace}"
+
+
+def _join_detail(*parts: str | None) -> str | None:
+	items = [part for part in parts if part]
+	if not items:
+		return None
+	return "\n\n".join(items)
+
+
+async def _extract_response_body(response: Response) -> tuple[Response, str | None]:
+	body = getattr(response, "body", None)
+	if isinstance(body, (bytes, bytearray)) and body:
+		return response, body.decode("utf-8", errors="replace")
+	if isinstance(body, str) and body:
+		return response, body
+	body_iterator = getattr(response, "body_iterator", None)
+	if body_iterator is None:
+		return response, None
+	chunks: list[bytes] = []
+	async for chunk in body_iterator:
+		if isinstance(chunk, (bytes, bytearray)):
+			chunks.append(bytes(chunk))
+		else:
+			chunks.append(str(chunk).encode("utf-8"))
+	if not chunks:
+		return response, None
+	body_bytes = b"".join(chunks)
+	headers = dict(response.headers)
+	headers.pop("content-length", None)
+	headers.pop("transfer-encoding", None)
+	return (
+		Response(
+			content=body_bytes,
+			status_code=response.status_code,
+			headers=headers,
+			media_type=response.media_type,
+			background=response.background,
+		),
+		body_bytes.decode("utf-8", errors="replace"),
+	)
+
+
+def _is_known_route(request: Request) -> bool:
+	for route in request.app.router.routes:
+		match, _ = route.matches(request.scope)
+		if match is Match.FULL:
+			return True
+	return False
+
+
 def get_settings() -> Settings:
 	return Settings()
 
@@ -138,6 +231,42 @@ class SlackRelay:
 			signing_secret=settings.slack_signing_secret,
 		)
 		self.handler = AsyncSlackRequestHandler(self.app)
+
+	@staticmethod
+	def _thread_detail_messages(detail: str | None, limit: int = 3500) -> list[str]:
+		if not detail:
+			return []
+		safe_detail = detail.replace("```", "``\\`")
+		chunk_size = max(1, limit - 8)
+		chunks = [safe_detail[i : i + chunk_size] for i in range(0, len(safe_detail), chunk_size)]
+		return [f"```\n{chunk}\n```" for chunk in chunks]
+
+	async def log_error(self, message: str, detail: str | None = None) -> None:
+		"""Best-effort error logging to the configured logging channel."""
+		if not self.settings.logging_channel_id:
+			return
+		try:
+			resp = await self.app.client.chat_postMessage(
+				channel=self.settings.logging_channel_id,
+				text=message,
+			)
+			thread_ts = resp.get("ts") if resp.get("ok") else None
+			if thread_ts:
+				messages = self._thread_detail_messages(detail)
+				for thread_message in messages:
+					await self.app.client.chat_postMessage(
+						channel=self.settings.logging_channel_id,
+						text=thread_message,
+						thread_ts=thread_ts,
+					)
+				if self.settings.logging_cc_user_id:
+					await self.app.client.chat_postMessage(
+						channel=self.settings.logging_channel_id,
+						text=f"CC: <@{self.settings.logging_cc_user_id}>",
+						thread_ts=thread_ts,
+					)
+		except Exception as exc:
+			print(f"Failed to write to logging channel: {exc}")
 
 	async def _resolve_target_channel(self, target_id: str) -> str:
 		if target_id.startswith("U"):
@@ -487,16 +616,16 @@ class SlackRelay:
 
 
 async def bot_heartbeat_task(settings: Settings, slack_relay: SlackRelay) -> None:
-	"""Background task that sends a heartbeat message every 5 minutes to the logging channel."""
+	"""Background task that sends a heartbeat message every 30 minutes to the logging channel."""
 	if not settings.logging_channel_id:
 		return
 
 	while True:
 		try:
-			await asyncio.sleep(300)  # 5 minutes
+			await asyncio.sleep(1800)  # 30 minutes
 			resp = await slack_relay.app.client.chat_postMessage(
 				channel=settings.logging_channel_id,
-				text=":alchemist: Bot is online!",
+				text=":alchemist: Bot is Online!",
 			)
 			if not resp.get("ok"):
 				print(f"Failed to send heartbeat: {resp}")
@@ -524,6 +653,51 @@ slack_relay = SlackRelay(settings)
 app = FastAPI(title=settings.app_name, lifespan=lifespan)
 
 
+@app.middleware("http")
+async def error_logging_middleware(request: Request, call_next):
+	path = request.url.path
+	if request.url.query:
+		path = f"{path}?{request.url.query}"
+	is_known_route = _is_known_route(request)
+	should_log = is_known_route and request.url.path != "/slack/events"
+	try:
+		response = await call_next(request)
+	except Exception as exc:
+		if should_log:
+			request_body = None
+			try:
+				request_body = await request.body()
+			except Exception:
+				request_body = None
+			await slack_relay.log_error(
+				_truncate_message(
+					f":warning: {request.method} {path} -> 500 {type(exc).__name__}: {exc}"
+				),
+				detail=_join_detail(
+					_format_request_snapshot(request, request_body),
+					_format_traceback(traceback.format_exc()),
+				),
+			)
+		raise
+	if should_log and response.status_code >= 400:
+		request_body = None
+		try:
+			request_body = await request.body()
+		except Exception:
+			request_body = None
+		response, response_body = await _extract_response_body(response)
+		await slack_relay.log_error(
+			_truncate_message(
+				f":warning: {request.method} {path} -> {response.status_code}"
+			),
+			detail=_join_detail(
+				_format_request_snapshot(request, request_body),
+				_format_response_snapshot(response_body or ""),
+			),
+		)
+	return response
+
+
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
 	return {"status": "ok"}
@@ -533,13 +707,52 @@ async def healthz() -> dict[str, str]:
 async def slack_events(request: Request):
 	# Slack signature verification is enforced by the Bolt handler when a signing secret is set.
 	if not settings.slack_signing_secret:
+		is_slack_request = bool(
+			request.headers.get("X-Slack-Signature")
+			and request.headers.get("X-Slack-Request-Timestamp")
+		)
+		await slack_relay.log_error(
+			":warning: /slack/events received without SLACK_SIGNING_SECRET; cannot verify signature."
+		)
+		if is_slack_request:
+			# Acknowledge Slack to avoid retries even when we cannot verify.
+			return Response(status_code=status.HTTP_200_OK)
 		raise HTTPException(
 			status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
 			detail="Server missing SLACK_SIGNING_SECRET; configure it in the environment",
 		)
 	try:
-		return await slack_relay.handler.handle(request)
-	except Exception:
+		response = await slack_relay.handler.handle(request)
+		request_body = None
+		try:
+			request_body = await request.body()
+		except Exception:
+			request_body = None
+		response, response_body = await _extract_response_body(response)
+		if response.status_code >= 400:
+			await slack_relay.log_error(
+				_truncate_message(
+					f":warning: {request.method} /slack/events -> {response.status_code}"
+				),
+				detail=_join_detail(
+					_format_request_snapshot(request, request_body),
+					_format_response_snapshot(response_body or ""),
+				),
+			)
+		return response
+	except Exception as exc:
+		request_body = None
+		try:
+			request_body = await request.body()
+		except Exception:
+			request_body = None
+		await slack_relay.log_error(
+			f":warning: /slack/events handler error: {exc}",
+			detail=_join_detail(
+				_format_request_snapshot(request, request_body),
+				_format_traceback(traceback.format_exc()),
+			),
+		)
 		# Always acknowledge to prevent Slack retries from leaking errors to callers.
 		return Response(status_code=status.HTTP_200_OK)
 
