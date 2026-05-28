@@ -1,5 +1,6 @@
 import asyncio
 import os
+import re
 import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -231,6 +232,12 @@ class SlackRelay:
 			signing_secret=settings.slack_signing_secret,
 		)
 		self.handler = AsyncSlackRequestHandler(self.app)
+		self._register_default_handlers()
+
+	def _register_default_handlers(self) -> None:
+		@self.app.action(re.compile(".*"))
+		async def _ack_any_action(ack) -> None:
+			await ack()
 
 	@staticmethod
 	def _thread_detail_messages(detail: str | None, limit: int = 3500) -> list[str]:
